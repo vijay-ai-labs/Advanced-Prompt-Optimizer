@@ -146,7 +146,6 @@ function App() {
         throw new Error('Optimization stream ended before completion')
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Something went wrong'
       const fallback = generateLocalOutput(rawPrompt, useCase, tone, outputFormat)
       setResult(fallback)
       setActiveTab('optimized')
