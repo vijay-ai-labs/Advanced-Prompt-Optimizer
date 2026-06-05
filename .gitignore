@@ -1,18 +1,59 @@
+﻿# dotenv environment variable files
 .env
+.env.*
+!.env.example
 
 # Logs
 logs
 *.log
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Build output
+dist/
+dist-ssr/
+.output/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional npm cache
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional stylelint cache
+.stylelintcache
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# Coverage directories
+coverage/
+.nyc_output/
+*.lcov
+
+# Vite cache
+.vite/
 
 # Editor directories and files
 .vscode/*
@@ -24,3 +65,32 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Misc
+lib-cov/
+build/Release/
+.bower_components/
+.cache/
+.parcel-cache/
+.next/
+.out/
+.nuxt/
+.vuepress/dist/
+.temp/
+.svelte-kit/
+**/.vitepress/dist
+**/.vitepress/cache
+.docusaurus/
+.serverless/
+.fusebox/
+.dynamodb/
+.firebase/
+.tern-port
+.pnpm-store
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
