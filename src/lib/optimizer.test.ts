@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { UseCase } from './types'
-import { analyzePrompt, computeScore, computeScoreBreakdown, generateLocalOutput } from './optimizer'
+import { analyzePrompt, computeScore, computeScoreBreakdown, countSectionHeaders, generateLocalOutput } from './optimizer'
 
 // Regression cover for the Structure score. The scorer reads section labels out
 // of prompt text, and the prompt text comes from two producers that decorate
@@ -40,6 +40,54 @@ describe('Structure score — locally built prompts', () => {
 
     expect(prompt).toMatch(/^Role:\n/)
     expect(prompt).toContain('\n\nObjective:\n')
+  })
+
+  it('counts only the seven headings, not the colons inside bullets', () => {
+    // The GTM template's requirement bullets read "- Cover ICP and
+    // segmentation: firmographics, ...". Those are content, not headings.
+    const { prompt } = generateLocalOutput('Launch our B2B analytics SaaS product', 'gtm', 'professional', 'paragraph')
+
+    expect(prompt).toMatch(/^- Cover ICP and segmentation:/m)
+    expect(countSectionHeaders(prompt)).toBe(7)
+  })
+})
+
+describe('Structure score — server.js label vocabulary', () => {
+  // The backend prompt in server.js dictates these labels. If either side's
+  // wording drifts, Structure silently drops - which is the bug this file
+  // exists to catch, so the contract is asserted label by label.
+  const backendLabels = [
+    // blog-content
+    'Role & Voice', 'Target Reader & Publication', 'Article Goal & Angle',
+    'Key Points to Cover', 'Format & Length', 'Tone & Style', 'Quality Criteria',
+    // coding
+    'Expert Role', 'Task Description', 'Stack & Environment', 'Functional Requirements',
+    'Input/Output Contract', 'Edge Cases & Error Handling', 'Constraints', 'Output Format', 'Quality Bar',
+    // research-analysis
+    'Analyst Role', 'Research Question', 'Scope & Boundaries', 'Evidence Standards & Sources',
+    'Output Structure', 'Depth & Uncertainty Handling', 'Deliverable Format',
+    // business-strategy
+    'Strategic Role', 'Objective', 'Stakeholder Context', 'Constraints & Resources',
+    'Deliverables', 'Success Metrics', 'Assumptions',
+    // image-generation
+    'Subject & Scene', 'Style & Medium', 'Composition & Framing', 'Lighting & Color Palette',
+    'Mood & Atmosphere', 'Technical Directives', 'Negative Constraints',
+    // general and gtm
+    'Role & Expertise', 'Background Context', 'Requirements', 'Context', 'Role',
+    'ICP & Segmentation', 'Positioning', 'Channel Mix', 'Sales Motion',
+    'Execution Roadmap', 'KPIs', 'Risks & Tradeoffs', 'Instructions',
+  ]
+
+  it.each(backendLabels)('recognises "%s" on its own line', (label) => {
+    expect(countSectionHeaders(`${label}:\nSome content here.`)).toBe(1)
+  })
+
+  it.each(backendLabels)('recognises "%s" with content on the same line', (label) => {
+    expect(countSectionHeaders(`${label}: some content here\nMore text follows.`)).toBe(1)
+  })
+
+  it.each(backendLabels)('recognises "%s" in bold', (label) => {
+    expect(countSectionHeaders(`**${label}:**\nSome content here.\nMore text.`)).toBe(1)
   })
 })
 
@@ -99,6 +147,14 @@ describe('Structure score — unstructured prompts earn nothing', () => {
     ['a plain request',            'Fix the login bug in my React app'],
     ['a label-like short phrase',  'Improve my resume format'],
     ['prose followed by bullets',  'Please write something about dogs.\n- Keep it friendly\n- Add some jokes'],
+    // Everything below contains a colon. None of it is a section heading.
+    ['a prose aside',              'Note: this needs to be done by Friday\nThanks in advance.'],
+    ['a bullet with a colon',      'Write a post\n- Example: keep it short\n- Another: add jokes'],
+    ['a clock time',               'Meet me at 10:30 tomorrow for the review\nBring the deck.'],
+    ['a URL',                      'Summarise https://example.com/docs for me\nKeep it short.'],
+    ['an aspect ratio',            'Render it at 16:9 aspect ratio\nMake it sharp.'],
+    ['lower-case key/value data',  'Convert this\nname: bob\nage: 42'],
+    ['a sentence ending in colon', 'Here are the things you must do:\nFix the bug.'],
   ])('%s scores 0', (_name, prompt) => {
     expect(structureScore(prompt, 'general')).toBe(0)
   })

@@ -93,7 +93,11 @@ const SECTION_LABEL_RE = /^[A-Z][A-Za-z0-9][A-Za-z0-9 &/'’-]{0,58}$/
 // Words that mark a line as a section name when it was written without a
 // trailing colon. Covers the labels used by both producers.
 const SECTION_KEYWORD_RE =
-  /\b(role|objective|goal|context|background|instructions?|constraints?|output|format|quality|criteria|bar|assumptions?|audience|readers?|problem|statement|steps?|stack|environment|requirements?|method|approach|subject|scene|composition|framing|lighting|colou?r|palette|mood|atmosphere|technical|directives?|negative|scope|boundaries|evidence|sources?|research|question|deliverables?|icp|segmentation|positioning|channel|mix|sales|motion|execution|roadmap|kpis?|metrics?|risks?|tradeoffs?|tone|style|voice|expertise|task|description|contract|edge|cases?|handling|depth|uncertainty|persona|examples?|success|length|article|publication|stakeholders?|resources?|camera)\b/i
+  /\b(role|objective|goal|context|background|instructions?|constraints?|output|format|quality|criteria|bar|assumptions?|audience|readers?|problem|statement|steps?|stack|environment|requirements?|method|approach|subject|scene|composition|framing|lighting|colou?r|palette|mood|atmosphere|technical|directives?|negative|scope|boundaries|evidence|sources?|research|question|deliverables?|icp|segmentation|positioning|channel|mix|sales|motion|execution|roadmap|kpis?|metrics?|risks?|tradeoffs?|tone|style|voice|expertise|task|description|contract|edge|cases?|handling|depth|uncertainty|persona|examples?|success|length|article|publication|stakeholders?|resources?|camera|key|points?)\b/i
+
+// Section labels are headings, not sentences. The longest label either
+// producer uses ("Edge Cases & Error Handling") is five words.
+const MAX_LABEL_WORDS = 5
 
 function stripEmphasis(s: string): string {
   return s
@@ -104,8 +108,9 @@ function stripEmphasis(s: string): string {
 }
 
 // Number of distinct labeled sections in a prompt. Distinct, so a label that
-// repeats does not inflate the count.
-function countSectionHeaders(raw: string): number {
+// repeats does not inflate the count. Exported so the drift between what the
+// builders emit and what the scorer recognises can be tested directly.
+export function countSectionHeaders(raw: string): number {
   const lines = raw.split(/\r?\n/)
   const multiLine = lines.filter((l) => l.trim() !== '').length > 1
   const seen = new Set<string>()
@@ -115,19 +120,29 @@ function countSectionHeaders(raw: string): number {
     if (line === '') continue
 
     line = line.replace(/^#{1,6}\s*/, '').replace(/^>\s*/, '')
-    const isListItem = /^(?:[-*•]\s+|\d+[.)]\s+)/.test(line)
-    line = stripEmphasis(line.replace(/^(?:[-*•]\s+|\d+[.)]\s+)/, ''))
+
+    // A bulleted line carries content, never a section name, so it is out
+    // whatever it holds - "- Cover ICP and segmentation: firmographics" is a
+    // requirement, not a heading. Numbered lines can legitimately be either.
+    if (/^[-*•]\s+/.test(line)) continue
+    line = stripEmphasis(line.replace(/^\d+[.)]\s+/, ''))
 
     const colonAt = line.indexOf(':')
     const label = stripEmphasis(colonAt === -1 ? line : line.slice(0, colonAt))
 
     if (!SECTION_LABEL_RE.test(label)) continue
-    if (label.split(/\s+/).length > 7) continue
+    if (label.split(/\s+/).length > MAX_LABEL_WORDS) continue
 
-    // A label with no colon only counts when it reads like a section name and
-    // sits on its own line, otherwise short prompts and bullets would register
-    // as structure.
-    if (colonAt === -1 && (isListItem || !multiLine || !SECTION_KEYWORD_RE.test(label))) continue
+    // A label that ends its line is convincing on its own. Anything else - a
+    // colon with content after it, or no colon at all - has to read like a
+    // section name, otherwise prose such as "Meet me at 10:30" or
+    // "Summarise https://example.com" would register as structure.
+    const endsLine = colonAt === line.length - 1
+    if (!endsLine && !SECTION_KEYWORD_RE.test(label)) continue
+
+    // A bare label additionally needs company: a one-line prompt is a request,
+    // not a section.
+    if (colonAt === -1 && !multiLine) continue
 
     seen.add(label.toLowerCase())
   }
