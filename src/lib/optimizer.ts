@@ -76,112 +76,148 @@ const IMAGE_COMPOSITION_RE = /\b(composition|framing|rule.of.thirds|foreground|m
 const IMAGE_NEGATIVE_RE = /\b(no |without |avoid |negative.constraint|negative.prompt|avoid:|exclude:)\b/i
 const IMAGE_TECHNICAL_RE = /\b(4k|8k|resolution|aspect.ratio|hdr|portrait|landscape|square|[0-9]+:[0-9]+|ultra.?hd|high.?detail|sharp|crisp|texture|photorealistic rendering)\b/i
 const ANALYSIS_STRUCTURE_RE = /\b(report|findings|recommendations|introduction|conclusion|section|methodology|framework|analysis|overview|summary|breakdown|deliverable|output|structure)\b/i
-const LABELED_SECTIONS_RE = /^(Role|Objective|Context|Instructions?|Constraints|Output Format|Quality Criteria|Assumptions?|Target Audience|Problem Statement|Debugging Steps|Root Cause|Stack|Requirements|Method|Subject|Composition|Lighting|Negative Prompts|Scope|Evidence|Research Question|ICP|Positioning|Channel|Sales Motion|Execution|KPIs?|Tone)\s*:/m
 
-export function computeScore(analysis: PromptAnalysis, taskType?: string): number {
-  let score = 0
+// ── Section header detection ───────────────────────────────────────────────
+//
+// Prompts reach the scorer from two producers that label their sections
+// differently: the local templates below write plain "Role:" lines, while the
+// model backend writes markdown ("**Role:**", "## Output Format") and picks
+// labels from an open-ended vocabulary ("Expert Role", "Stack & Environment").
+// Labels are therefore normalised before being matched, rather than compared
+// against one fixed list.
 
-  if (analysis.hasAction) score += 20
-  else if (!analysis.isShort) score += 8
+// Shape of a section label once decoration is stripped: starts capitalised,
+// no sentence punctuation, short enough to be a heading rather than prose.
+const SECTION_LABEL_RE = /^[A-Z][A-Za-z0-9][A-Za-z0-9 &/'’-]{0,58}$/
 
-  if (taskType === 'image-generation') {
-    const raw = analysis._raw ?? ''
-    if (analysis.wordCount >= 20) score += 15
-    else if (analysis.wordCount >= 10) score += 10
-    else if (analysis.wordCount >= 5) score += 5
-    if (IMAGE_STYLE_RE.test(raw) || IMAGE_COMPOSITION_RE.test(raw)) score += 15
-    if (IMAGE_COMPOSITION_RE.test(raw)) score += 25
-    if (IMAGE_NEGATIVE_RE.test(raw)) score += 15
-    if (IMAGE_TECHNICAL_RE.test(raw)) score += 10
-  } else {
-    const rawText = analysis._raw ?? ''
-    if (analysis.wordCount >= 30) score += 15
-    else if (analysis.wordCount >= 15) score += 10
-    else if (analysis.wordCount >= 8) score += 5
-    if (LABELED_SECTIONS_RE.test(rawText)) score += 15
-    else if (analysis.hasAudience) score += 15
-    if (analysis.hasOutputFormat) score += 10
-    if (taskType === 'research-analysis') {
-      if (!LABELED_SECTIONS_RE.test(rawText) && ANALYSIS_STRUCTURE_RE.test(rawText)) score += 10
-      if (analysis.hasTone) score += 0
-    } else {
-      if (analysis.hasTone) score += 10
-    }
-    if (analysis.hasConstraints) score += 15
-    if (!analysis.hasVaguePhrases) score += 15
-  }
+// Words that mark a line as a section name when it was written without a
+// trailing colon. Covers the labels used by both producers.
+const SECTION_KEYWORD_RE =
+  /\b(role|objective|goal|context|background|instructions?|constraints?|output|format|quality|criteria|bar|assumptions?|audience|readers?|problem|statement|steps?|stack|environment|requirements?|method|approach|subject|scene|composition|framing|lighting|colou?r|palette|mood|atmosphere|technical|directives?|negative|scope|boundaries|evidence|sources?|research|question|deliverables?|icp|segmentation|positioning|channel|mix|sales|motion|execution|roadmap|kpis?|metrics?|risks?|tradeoffs?|tone|style|voice|expertise|task|description|contract|edge|cases?|handling|depth|uncertainty|persona|examples?|success|length|article|publication|stakeholders?|resources?|camera)\b/i
 
-  return Math.min(score, 100)
+function stripEmphasis(s: string): string {
+  return s
+    .trim()
+    .replace(/^(?:\*\*|__|\*|_)+/, '')
+    .replace(/(?:\*\*|__|\*|_)+$/, '')
+    .trim()
 }
 
-// ── Score breakdown ────────────────────────────────────────────────────────
-//
-// 5 visible dimensions derived from the same PromptAnalysis used for scoring.
-// Max values: Clarity 20, Specificity 15, Structure 25, Constraints 15, Output Format 10 → 85 of 100
-// (language quality rolls into Specificity visually — keeps the UI to 5 rows)
+// Number of distinct labeled sections in a prompt. Distinct, so a label that
+// repeats does not inflate the count.
+function countSectionHeaders(raw: string): number {
+  const lines = raw.split(/\r?\n/)
+  const multiLine = lines.filter((l) => l.trim() !== '').length > 1
+  const seen = new Set<string>()
 
-export function computeScoreBreakdown(analysis: PromptAnalysis, taskType?: string): ScoreBreakdownItem[] {
-  function status(s: number, m: number): 'missing' | 'partial' | 'strong' {
-    const r = s / m
-    if (r >= 0.75) return 'strong'
-    if (r > 0) return 'partial'
-    return 'missing'
+  for (const rawLine of lines) {
+    let line = rawLine.trim()
+    if (line === '') continue
+
+    line = line.replace(/^#{1,6}\s*/, '').replace(/^>\s*/, '')
+    const isListItem = /^(?:[-*•]\s+|\d+[.)]\s+)/.test(line)
+    line = stripEmphasis(line.replace(/^(?:[-*•]\s+|\d+[.)]\s+)/, ''))
+
+    const colonAt = line.indexOf(':')
+    const label = stripEmphasis(colonAt === -1 ? line : line.slice(0, colonAt))
+
+    if (!SECTION_LABEL_RE.test(label)) continue
+    if (label.split(/\s+/).length > 7) continue
+
+    // A label with no colon only counts when it reads like a section name and
+    // sits on its own line, otherwise short prompts and bullets would register
+    // as structure.
+    if (colonAt === -1 && (isListItem || !multiLine || !SECTION_KEYWORD_RE.test(label))) continue
+
+    seen.add(label.toLowerCase())
   }
 
-  const clarityScore = analysis.hasAction ? 20 : analysis.isShort ? 0 : 8
+  return seen.size
+}
+
+interface ScoreComponent { label: string; score: number; max: number }
+
+// Single source of truth for scoring: computeScore and computeScoreBreakdown
+// both derive from this list, so the total score always equals the sum of
+// the breakdown rows shown in the UI.
+function computeScoreComponents(analysis: PromptAnalysis, taskType?: string): ScoreComponent[] {
   const raw = analysis._raw ?? ''
+  const clarityScore = analysis.hasAction ? 20 : analysis.isShort ? 0 : 8
 
   if (taskType === 'image-generation') {
     const hasStyle = IMAGE_STYLE_RE.test(raw)
     const hasComposition = IMAGE_COMPOSITION_RE.test(raw)
     const hasNegative = IMAGE_NEGATIVE_RE.test(raw)
     const hasTechnical = IMAGE_TECHNICAL_RE.test(raw)
-    const hasImageLabels = LABELED_SECTIONS_RE.test(raw)
     const specScore = analysis.wordCount >= 20 ? 15 : analysis.wordCount >= 10 ? 10 : analysis.wordCount >= 5 ? 5 : 0
-    const specWithStyle = Math.min(specScore + (hasStyle ? 5 : 0), 15)
-    const structureScore = hasImageLabels ? 25 : hasComposition ? 20 : (hasStyle ? 12 : 0)
-    const constraintsScore = hasNegative ? 15 : 0
-    const formatScore = hasTechnical ? 10 : 0
 
     return [
-      { label: 'Clarity',       score: clarityScore,    max: 20, status: status(clarityScore, 20) },
-      { label: 'Specificity',   score: specWithStyle,   max: 15, status: status(specWithStyle, 15) },
-      { label: 'Structure',     score: structureScore,  max: 25, status: status(structureScore, 25) },
-      { label: 'Constraints',   score: constraintsScore,max: 15, status: status(constraintsScore, 15) },
-      { label: 'Output Format', score: formatScore,     max: 10, status: status(formatScore, 10) },
+      { label: 'Clarity',              score: clarityScore,                          max: 20 },
+      { label: 'Specificity',          score: specScore,                             max: 15 },
+      { label: 'Style',                score: (hasStyle || hasComposition) ? 15 : 0, max: 15 },
+      { label: 'Composition',          score: hasComposition ? 25 : 0,               max: 25 },
+      { label: 'Negative Constraints', score: hasNegative ? 15 : 0,                  max: 15 },
+      { label: 'Technical Detail',     score: hasTechnical ? 10 : 0,                 max: 10 },
     ]
   }
 
   const specScore =
-    analysis.wordCount >= 30
-      ? 15
-      : analysis.wordCount >= 15
-      ? 10
-      : analysis.wordCount >= 8
-      ? 5
-      : 0
-  const specWithQuality = Math.min(specScore + (analysis.hasVaguePhrases ? 0 : 8), 15)
+    analysis.wordCount >= 30 ? 15 :
+    analysis.wordCount >= 15 ? 10 :
+    analysis.wordCount >= 8 ? 5 : 0
+  // Partial credit, so a lightly structured prompt scores between "no
+  // structure at all" and a fully sectioned one.
+  const sectionCount = countSectionHeaders(raw)
+  const structureScore =
+    sectionCount >= 3 ? 15 :
+    sectionCount === 2 ? 10 :
+    sectionCount === 1 ? 5 :
+    analysis.hasAudience ? 5 : 0
 
-  let structureScore: number
-  const hasLabeledSections = LABELED_SECTIONS_RE.test(raw)
-  if (hasLabeledSections) {
-    structureScore = 22
-  } else if (taskType === 'research-analysis') {
-    structureScore = ANALYSIS_STRUCTURE_RE.test(raw) ? 14 : (analysis.hasAudience ? 8 : 0)
+  const components: ScoreComponent[] = [
+    { label: 'Clarity',     score: clarityScore, max: 20 },
+    { label: 'Specificity', score: specScore,    max: 15 },
+    { label: 'Structure',   score: structureScore, max: 15 },
+  ]
+
+  if (taskType === 'research-analysis') {
+    const researchDepthScore = ANALYSIS_STRUCTURE_RE.test(raw) ? 10 : 0
+    components.push({ label: 'Research Depth', score: researchDepthScore, max: 10 })
   } else {
-    structureScore = (analysis.hasAudience ? 10 : 0) + (analysis.hasTone ? 5 : 0)
+    components.push({ label: 'Tone', score: analysis.hasTone ? 10 : 0, max: 10 })
   }
 
-  const constraintsScore = analysis.hasConstraints ? 15 : 0
-  const formatScore = analysis.hasOutputFormat ? 10 : 0
+  components.push({ label: 'Output Format',    score: analysis.hasOutputFormat ? 10 : 0, max: 10 })
+  components.push({ label: 'Constraints',      score: analysis.hasConstraints ? 15 : 0,  max: 15 })
+  components.push({ label: 'Language Quality', score: analysis.hasVaguePhrases ? 0 : 15, max: 15 })
 
-  return [
-    { label: 'Clarity',       score: clarityScore,      max: 20, status: status(clarityScore, 20) },
-    { label: 'Specificity',   score: specWithQuality,   max: 15, status: status(specWithQuality, 15) },
-    { label: 'Structure',     score: structureScore,    max: 25, status: status(structureScore, 25) },
-    { label: 'Constraints',   score: constraintsScore,  max: 15, status: status(constraintsScore, 15) },
-    { label: 'Output Format', score: formatScore,       max: 10, status: status(formatScore, 10) },
-  ]
+  return components
+}
+
+export function computeScore(analysis: PromptAnalysis, taskType?: string): number {
+  const total = computeScoreComponents(analysis, taskType).reduce((sum, c) => sum + c.score, 0)
+  return Math.min(total, 100)
+}
+
+// ── Score breakdown ────────────────────────────────────────────────────────
+//
+// Same components used by computeScore, itemized for the UI. Rows always
+// sum to the value computeScore returns (for the same analysis/taskType).
+
+export function computeScoreBreakdown(analysis: PromptAnalysis, taskType?: string): ScoreBreakdownItem[] {
+  function status(s: number, m: number): 'missing' | 'partial' | 'strong' {
+    const r = m === 0 ? 0 : s / m
+    if (r >= 0.75) return 'strong'
+    if (r > 0) return 'partial'
+    return 'missing'
+  }
+
+  return computeScoreComponents(analysis, taskType).map((c) => ({
+    label: c.label,
+    score: c.score,
+    max: c.max,
+    status: status(c.score, c.max),
+  }))
 }
 
 // ── Task cleaning ──────────────────────────────────────────────────────────
@@ -450,8 +486,9 @@ function detectAssumptions(analysis: PromptAnalysis, useCase: UseCase, rawPrompt
 
 // ── Use-case prompt builders ───────────────────────────────────────────────
 
+// Keeps the single blank line between sections; only collapses accidental runs.
 function join(lines: string[]): string {
-  return lines.filter((l) => l !== '').join('\n').replace(/\n{3,}/g, '\n\n')
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
 interface StrongPromptParts {
@@ -475,25 +512,25 @@ function bullets(lines: string[]): string[] {
 
 function buildStrongPrompt(parts: StrongPromptParts): string {
   return join([
-    'Role',
+    'Role:',
     parts.role,
     '',
-    'Objective',
+    'Objective:',
     parts.objective,
     '',
-    'Context',
+    'Context:',
     ...bullets(parts.context),
     '',
-    'Requirements',
+    'Requirements:',
     ...bullets(parts.requirements),
     '',
-    'Method',
+    'Method:',
     ...bullets(parts.method),
     '',
-    'Output Format',
+    'Output Format:',
     ...bullets(parts.outputFormat),
     '',
-    'Quality Criteria',
+    'Quality Criteria:',
     ...bullets(parts.qualityCriteria),
   ])
 }
