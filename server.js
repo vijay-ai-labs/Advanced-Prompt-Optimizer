@@ -2,6 +2,7 @@ import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import OpenAI from 'openai'
+import { validatePrompt, requiresPlaceholders, NO_TOPIC_DIRECTIVE } from './src/lib/promptValidation.js'
 
 const app = express()
 const PORT = process.env.PORT || 8787
@@ -569,6 +570,10 @@ function buildUserMessage(rawPrompt, useCase, tone, outputFormat) {
   if (outputFormat && outputFormat !== 'paragraph') userHints.push(`Output format the optimized prompt should request from the AI: ${FORMAT_GUIDANCE[outputFormat] ?? outputFormat}`)
 
   const weaknesses = getPromptWeaknessHints(rawPrompt)
+  // A prompt with no subject reaches here only when the user knowingly chose to
+  // optimize anyway. The system prompt tells the model to infer missing details;
+  // this cancels that for the one thing it must never invent — the topic itself.
+  const noTopic = requiresPlaceholders(validatePrompt(rawPrompt, useCase).code)
 
   const parts = [
     `## Rough User Prompt\n${rawPrompt}`,
@@ -576,6 +581,7 @@ function buildUserMessage(rawPrompt, useCase, tone, outputFormat) {
     weaknesses.length
       ? `## Detected Structural Gaps (fix these in the optimized prompt)\n${weaknesses.map((h) => `- ${h}`).join('\n')}`
       : '',
+    noTopic ? NO_TOPIC_DIRECTIVE : '',
     `## Your Task\nTransform the rough prompt above into an advanced, model-ready optimized prompt using labeled sections.\n\nCRITICAL RULES:\n- The "prompt" field MUST use labeled sections (e.g., Role:, Objective:, Instructions:, Constraints:, Output Format:, Quality Criteria:)\n- NEVER produce a single paragraph — use section labels on their own lines\n- Do NOT answer the user's original request — generate a PROMPT that another AI will execute\n- Address every structural gap listed above\n- Every instruction in the optimized prompt must be specific and testable, not vague`,
   ]
 
@@ -625,6 +631,24 @@ function parseAndValidate(text) {
   }
 }
 
+const JSON_ESCAPES = { n: '\n', t: '\t', b: '\b', f: '\f', '"': '"', '\\': '\\', '/': '/', r: '' }
+
+/**
+ * Decode the escapes inside a JSON string body in one pass. Chained .replace()
+ * calls cannot do this: unescaping \n before \\ turns the two characters "\n"
+ * (written in JSON as \\n) into a real newline. A trailing partial escape is
+ * dropped — the next chunk completes it.
+ */
+function unescapeJsonString(s) {
+  return s
+    .replace(/\\u[0-9a-fA-F]{0,3}$/, '')
+    .replace(/\\(u[0-9a-fA-F]{4}|.)/g, (_, esc) =>
+      esc[0] === 'u' && esc.length === 5
+        ? String.fromCharCode(parseInt(esc.slice(1), 16))
+        : JSON_ESCAPES[esc] ?? esc,
+    )
+}
+
 function classifyError(msg) {
   if (/Incorrect API key|invalid_api_key|No API key/i.test(msg))
     return 'Invalid OpenAI API key. Check OPENAI_API_KEY in .env.'
@@ -636,8 +660,9 @@ function classifyError(msg) {
 app.post('/api/optimize', async (req, res) => {
   const { rawPrompt, useCase = 'general', tone = 'clear', outputFormat = 'paragraph' } = req.body ?? {}
 
-  if (!rawPrompt?.trim())
-    return res.status(400).json({ error: 'rawPrompt is required and cannot be empty.' })
+  const verdict = validatePrompt(rawPrompt ?? '', useCase)
+  if (verdict.level === 'block')
+    return res.status(400).json({ error: verdict.message, code: verdict.code, title: verdict.title })
 
   if (!API_KEY) {
     console.error('[server] OPENAI_API_KEY not set')
@@ -688,8 +713,9 @@ app.post('/api/optimize/stream', async (req, res) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   }
 
-  if (!rawPrompt?.trim()) {
-    send('error', { error: 'rawPrompt is required and cannot be empty.' })
+  const verdict = validatePrompt(rawPrompt ?? '', useCase)
+  if (verdict.level === 'block') {
+    send('error', { error: verdict.message, code: verdict.code, title: verdict.title })
     return res.end()
   }
 
@@ -727,12 +753,7 @@ app.post('/api/optimize/stream', async (req, res) => {
 
       const match = PROMPT_RE.exec(fullText) ?? PROMPT_PARTIAL_RE.exec(fullText)
       if (match) {
-        const partial = match[1]
-          .replace(/\\n/g, '\n')
-          .replace(/\\t/g, '\t')
-          .replace(/\\r/g, '')
-          .replace(/\\"/g, '"')
-          .replace(/\\\\/g, '\\')
+        const partial = unescapeJsonString(match[1])
 
         if (partial.length > sentLen) {
           send('token', { text: partial.slice(sentLen) })
