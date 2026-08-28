@@ -1,8 +1,8 @@
 import {
   Copy, Check, Sparkles, TrendingUp, AlertCircle, ListChecks, GitCompare,
-  Loader2, Bookmark, BookmarkCheck, ThumbsUp, ThumbsDown, Flag, Lightbulb,
+  Loader2, Bookmark, BookmarkCheck, Lightbulb,
 } from 'lucide-react'
-import type { OptimizedResult, ScoreBreakdownItem, OutputFeedback } from '../lib/types'
+import type { OptimizedResult, ScoreBreakdownItem } from '../lib/types'
 import { computeStats } from '../lib/savedPrompts'
 
 // ── Score helpers ──────────────────────────────────────────────────────────
@@ -102,19 +102,43 @@ function BreakdownItem({ item }: { item: ScoreBreakdownItem }) {
 
 // ── Diff helpers ───────────────────────────────────────────────────────────
 
-type DiffLineType = 'added' | 'original' | 'blank'
+type DiffLineType = 'added' | 'original' | 'blank' | 'label'
 interface DiffLine { text: string; type: DiffLineType }
 
-function buildDiff(optimizedPrompt: string): DiffLine[] {
+// Section headers used across all prompt builders (both the standalone-line
+// style from buildStrongPrompt and the "Label: content" style from image
+// prompts) — lines matching this are structural, not "added" content.
+const STANDALONE_LABEL_RE =
+  /^(Role|Objective|Context|Requirements|Method|Output Format|Quality Criteria|Constraints|Instructions?|Assumptions?|Target Audience|Problem Statement|Debugging Steps|Root Cause|Stack|Scope|Evidence|Research Question|ICP|Positioning|Channel Mix|Sales Motion|Execution Roadmap|KPIs?|Tone|Subject\s*&\s*Scene|Style\s*&\s*Medium|Composition\s*&\s*Framing|Lighting\s*&\s*Color Palette|Mood\s*&\s*Atmosphere|Technical Directives|Negative Prompts?)\s*:?\s*$/i
+
+function normalizeWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2)
+}
+
+function buildDiff(optimizedPrompt: string, rawPrompt: string): DiffLine[] {
+  const rawWords = new Set(normalizeWords(rawPrompt))
+
   return optimizedPrompt.split('\n').map((line): DiffLine => {
     if (!line.trim()) return { text: '', type: 'blank' }
-    if (/^(Task:|Subject:|Goal:)/.test(line)) return { text: line, type: 'original' }
-    return { text: line, type: 'added' }
+    if (STANDALONE_LABEL_RE.test(line.trim())) return { text: line, type: 'label' }
+
+    // "Label: content" lines (e.g. image prompts) — compare only the content half.
+    const inlineLabelMatch = line.match(/^([A-Z][A-Za-z &]{1,25}):\s*(.+)$/)
+    const content = inlineLabelMatch ? inlineLabelMatch[2] : line
+
+    const words = normalizeWords(content)
+    const overlap = words.length ? words.filter((w) => rawWords.has(w)).length / words.length : 0
+
+    return { text: line, type: overlap >= 0.5 ? 'original' : 'added' }
   })
 }
 
-function DiffView({ prompt }: { prompt: string }) {
-  const lines = buildDiff(prompt)
+function DiffView({ prompt, rawPrompt }: { prompt: string; rawPrompt: string }) {
+  const lines = buildDiff(prompt, rawPrompt)
   return (
     <div className="rounded-xl bg-slate-50 border border-slate-200 p-4 space-y-0.5 overflow-x-auto">
       <div className="flex items-center gap-4 mb-3 pb-2 border-b border-slate-200">
@@ -124,13 +148,19 @@ function DiffView({ prompt }: { prompt: string }) {
         </span>
         <span className="flex items-center gap-1.5 text-[10px] text-slate-500">
           <span className="w-2 h-2 rounded-sm bg-slate-400 shrink-0" />
-          Original input
+          From your original prompt
         </span>
       </div>
-      {lines.map((line, i) =>
-        line.type === 'blank' ? (
-          <div key={i} className="h-2" />
-        ) : (
+      {lines.map((line, i) => {
+        if (line.type === 'blank') return <div key={i} className="h-2" />
+        if (line.type === 'label') {
+          return (
+            <div key={i} className="px-3 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+              {line.text}
+            </div>
+          )
+        }
+        return (
           <div
             key={i}
             className={`px-3 py-1 rounded text-xs leading-relaxed font-mono border-l-2 ${
@@ -142,7 +172,7 @@ function DiffView({ prompt }: { prompt: string }) {
             {line.text}
           </div>
         )
-      )}
+      })}
     </div>
   )
 }
@@ -176,9 +206,6 @@ interface Props {
   isOptimizing: boolean
   onSave: () => void
   isSaved: boolean
-  feedback: OutputFeedback
-  onRate: (r: 'up' | 'down') => void
-  onFlag: () => void
 }
 
 export function OutputPanel({
@@ -187,7 +214,6 @@ export function OutputPanel({
   activeTab, setActiveTab,
   isOptimizing,
   onSave, isSaved,
-  feedback, onRate, onFlag,
 }: Props) {
 
   // ── Initial spinner (no streaming text yet) ────────────────────────────
@@ -338,7 +364,7 @@ export function OutputPanel({
           </pre>
         </div>
       ) : (
-        <DiffView prompt={result.prompt} />
+        <DiffView prompt={result.prompt} rawPrompt={result.rawPromptSnapshot} />
       )}
 
       {/* Output stats */}
@@ -414,43 +440,6 @@ export function OutputPanel({
         </div>
       )}
 
-      {/* Feedback row */}
-      <div className="flex items-center gap-2 pt-1 border-t border-slate-200">
-        <span className="text-[10px] text-slate-400 mr-1">Rate:</span>
-        <button
-          onClick={() => onRate('up')}
-          title="Good result"
-          className={`p-1.5 rounded-lg transition-colors ${
-            feedback.rating === 'up'
-              ? 'bg-emerald-100 text-emerald-600'
-              : 'text-slate-400 hover:text-emerald-600 hover:bg-emerald-50'
-          }`}
-        >
-          <ThumbsUp size={13} />
-        </button>
-        <button
-          onClick={() => onRate('down')}
-          title="Poor result"
-          className={`p-1.5 rounded-lg transition-colors ${
-            feedback.rating === 'down'
-              ? 'bg-red-100 text-red-600'
-              : 'text-slate-400 hover:text-red-500 hover:bg-red-50'
-          }`}
-        >
-          <ThumbsDown size={13} />
-        </button>
-        <button
-          onClick={onFlag}
-          title="Flag this result"
-          className={`p-1.5 rounded-lg transition-colors ${
-            feedback.flagged
-              ? 'bg-amber-100 text-amber-600'
-              : 'text-slate-400 hover:text-amber-600 hover:bg-amber-50'
-          }`}
-        >
-          <Flag size={13} />
-        </button>
-      </div>
     </div>
   )
 }

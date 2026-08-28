@@ -4,7 +4,8 @@ import { InputPanel } from './components/InputPanel'
 import { OutputPanel, type OutputTab } from './components/OutputPanel'
 import { HistoryDrawer } from './components/HistoryDrawer'
 import { analyzePrompt, computeScore, computeScoreBreakdown, generateLocalOutput } from './lib/optimizer'
-import { loadSaved, persistSaved } from './lib/savedPrompts'
+import { validatePrompt } from './lib/promptValidation.js'
+import { loadSaved, persistSaved, loadHistory, persistHistory, MAX_HISTORY } from './lib/savedPrompts'
 import type {
   UseCase, Tone, OutputFormat,
   OptimizedResult, HistoryItem,
@@ -12,6 +13,18 @@ import type {
 } from './lib/types'
 
 const DEFAULT_FEEDBACK: OutputFeedback = { rating: null, flagged: false }
+
+interface Snapshot {
+  rawPrompt: string
+  result: OptimizedResult | null
+  useCase: UseCase
+  tone: Tone
+  outputFormat: OutputFormat
+}
+
+type RedoEntry =
+  | { onApply: 'clear'; target: Snapshot; clearBackfill: Snapshot | null }
+  | { onApply: 'history'; target: Snapshot; historyItem: HistoryItem }
 
 function App() {
   const [rawPrompt, setRawPrompt] = useState('')
@@ -22,29 +35,57 @@ function App() {
   const [streamingText, setStreamingText] = useState('')
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
-  const [history, setHistory] = useState<HistoryItem[]>([])
+  const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory())
   const [historyOpen, setHistoryOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<OutputTab>('optimized')
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [feedback, setFeedback] = useState<OutputFeedback>(DEFAULT_FEEDBACK)
   const [isSaved, setIsSaved] = useState(false)
   const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>(() => loadSaved())
+  const [warnOverridden, setWarnOverridden] = useState(false)
+  const [preClearSnapshot, setPreClearSnapshot] = useState<Snapshot | null>(null)
+  const [redoStack, setRedoStack] = useState<RedoEntry[]>([])
 
-  const pushHistory = (prompt: string, res: OptimizedResult) => {
-    setHistory((prev) => [
-      ...prev.slice(-4),
-      { rawPrompt: prompt, result: res, useCase, tone, outputFormat, timestamp: Date.now() },
-    ])
+  // Any edit to the prompt invalidates a previous "optimize anyway" — the new
+  // text has to earn its own pass through validation. It also breaks the redo
+  // chain: redoing after a fresh edit would silently discard what was just typed.
+  const updateRawPrompt = (v: string) => {
+    setRawPrompt(v)
+    setWarnOverridden(false)
+    if (error) setError('')
+    if (redoStack.length) setRedoStack([])
+  }
+
+  const pushHistory =(prompt: string, res: OptimizedResult) => {
+    setHistory((prev) => {
+      const next = [
+        ...prev.slice(-(MAX_HISTORY - 1)),
+        { rawPrompt: prompt, result: res, useCase, tone, outputFormat, timestamp: Date.now() },
+      ]
+      persistHistory(next)
+      return next
+    })
   }
 
   // ── Streaming optimize ───────────────────────────────────────────────────
 
   const handleOptimize = async () => {
-    if (!rawPrompt.trim()) {
-      setError('Please enter a prompt before optimizing.')
+    if (isOptimizing) return
+
+    // Gate before the network. The catch below turns every failure into a local
+    // fallback result, so a rejection that reached it would be shown to the user
+    // as a successful optimization — junk has to be stopped here instead.
+    const verdict = validatePrompt(rawPrompt, useCase)
+    if (verdict.level === 'block') {
+      setError(verdict.message)
       return
     }
-    if (isOptimizing) return
+    // Every warn tier needs an explicit override. Mode mismatch is the exception:
+    // it is advisory, and reaching here means the user kept their selection.
+    if (verdict.level === 'warn' && verdict.code !== 'mode-mismatch' && !warnOverridden) {
+      setError('')
+      return
+    }
 
     setError('')
     setIsOptimizing(true)
@@ -52,6 +93,8 @@ function App() {
     setResult(null)
     setFeedback(DEFAULT_FEEDBACK)
     setIsSaved(false)
+    setPreClearSnapshot(null)
+    setRedoStack([])
 
     try {
       const res = await fetch('/api/optimize/stream', {
@@ -132,6 +175,9 @@ function App() {
               setActiveTab('optimized')
               pushHistory(rawPrompt, newResult)
               completed = true
+              // Nothing follows the done event; releasing the body here stops
+              // the connection being held open until the server times out.
+              reader.cancel().catch(() => { /* already closed */ })
               break outer
             }
 
@@ -145,7 +191,7 @@ function App() {
       if (!completed) {
         throw new Error('Optimization stream ended before completion')
       }
-    } catch (err) {
+    } catch {
       const fallback = generateLocalOutput(rawPrompt, useCase, tone, outputFormat)
       setResult(fallback)
       setActiveTab('optimized')
@@ -157,42 +203,95 @@ function App() {
     }
   }
 
-  // ── History / undo ───────────────────────────────────────────────────────
+  // ── History / undo / redo ───────────────────────────────────────────────
 
-  const handleUndo = () => {
-    if (history.length < 2) return
-    const prev = history[history.length - 2]
-    setHistory((h) => h.slice(0, -1))
-    setRawPrompt(prev.rawPrompt)
-    setResult(prev.result)
-    setUseCase(prev.useCase)
-    setTone(prev.tone)
-    setOutputFormat(prev.outputFormat)
+  const applySnapshot = (snap: Snapshot) => {
+    setRawPrompt(snap.rawPrompt)
+    setWarnOverridden(false)
+    setResult(snap.result)
+    setUseCase(snap.useCase)
+    setTone(snap.tone)
+    setOutputFormat(snap.outputFormat)
     setFeedback(DEFAULT_FEEDBACK)
     setIsSaved(false)
   }
 
+  const handleUndo = () => {
+    if (preClearSnapshot) {
+      const snap = preClearSnapshot
+      const current: Snapshot = { rawPrompt, result, useCase, tone, outputFormat }
+      setRedoStack((r) => [...r, { onApply: 'clear', target: current, clearBackfill: snap }])
+      setPreClearSnapshot(null)
+      applySnapshot(snap)
+      return
+    }
+    if (history.length < 2) return
+    const poppedItem = history[history.length - 1]
+    const prev = history[history.length - 2]
+    const current: Snapshot = {
+      rawPrompt: poppedItem.rawPrompt, result: poppedItem.result,
+      useCase: poppedItem.useCase, tone: poppedItem.tone, outputFormat: poppedItem.outputFormat,
+    }
+    setRedoStack((r) => [...r, { onApply: 'history', target: current, historyItem: poppedItem }])
+    setHistory((h) => {
+      const next = h.slice(0, -1)
+      persistHistory(next)
+      return next
+    })
+    applySnapshot(prev)
+  }
+
+  const handleRedo = () => {
+    if (redoStack.length === 0) return
+    const entry = redoStack[redoStack.length - 1]
+    setRedoStack((r) => r.slice(0, -1))
+    if (entry.onApply === 'clear') {
+      setPreClearSnapshot(entry.clearBackfill)
+    } else {
+      setHistory((h) => {
+        const next = [...h, entry.historyItem]
+        persistHistory(next)
+        return next
+      })
+    }
+    applySnapshot(entry.target)
+  }
+
   const handleClear = () => {
+    if (rawPrompt.trim() || result) {
+      setPreClearSnapshot({ rawPrompt, result, useCase, tone, outputFormat })
+    }
     setRawPrompt('')
+    setWarnOverridden(false)
     setResult(null)
     setStreamingText('')
     setError('')
     setCopied(false)
     setHistory([])
+    persistHistory([])
     setFeedback(DEFAULT_FEEDBACK)
     setIsSaved(false)
+    setRedoStack([])
   }
 
-  const handleCopy = () => {
+  // navigator.clipboard is undefined outside a secure context, and writeText
+  // rejects when permission is refused. Either one used to surface as an
+  // uncaught error with no feedback in the UI.
+  const handleCopy = async () => {
     if (!result) return
-    navigator.clipboard.writeText(result.prompt).then(() => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable')
+      await navigator.clipboard.writeText(result.prompt)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
-    })
+    } catch {
+      setError('Copy failed — select the text and copy it manually.')
+    }
   }
 
   const handleRestore = (item: HistoryItem) => {
     setRawPrompt(item.rawPrompt)
+    setWarnOverridden(true)
     setResult(item.result)
     setUseCase(item.useCase)
     setTone(item.tone)
@@ -201,6 +300,8 @@ function App() {
     setHistoryOpen(false)
     setFeedback(DEFAULT_FEEDBACK)
     setIsSaved(false)
+    setPreClearSnapshot(null)
+    setRedoStack([])
   }
 
   // ── Saved prompts ────────────────────────────────────────────────────────
@@ -227,14 +328,16 @@ function App() {
 
   const handleRestoreSaved = (item: SavedPrompt) => {
     setRawPrompt(item.rawPrompt)
+    setWarnOverridden(true)
     const savedTaskType = item.useCase === 'image-generation' ? 'image-generation' : item.useCase === 'research' ? 'research-analysis' : item.useCase
+    const beforeAnalysis = analyzePrompt(item.rawPrompt)
     const afterAnalysis = analyzePrompt(item.optimizedPrompt)
     setResult({
       prompt: item.optimizedPrompt,
       improvements: [],
       missingDetails: [],
       score: item.score,
-      scoreBreakdown: [],
+      scoreBreakdown: computeScoreBreakdown(beforeAnalysis, savedTaskType),
       afterScore: computeScore(afterAnalysis, savedTaskType),
       afterScoreBreakdown: computeScoreBreakdown(afterAnalysis, savedTaskType),
       rawPromptSnapshot: item.rawPrompt,
@@ -249,6 +352,8 @@ function App() {
       flagged: item.flagged ?? false,
     })
     setIsSaved(true)
+    setPreClearSnapshot(null)
+    setRedoStack([])
   }
 
   const handleRemoveSaved = (id: string) => {
@@ -257,28 +362,15 @@ function App() {
     persistSaved(updated)
   }
 
-  // ── Feedback ─────────────────────────────────────────────────────────────
-
-  const handleRate = (rating: 'up' | 'down') => {
-    setFeedback((prev) => ({
-      ...prev,
-      rating: prev.rating === rating ? null : rating,
-    }))
-  }
-
-  const handleFlag = () => {
-    setFeedback((prev) => ({ ...prev, flagged: !prev.flagged }))
-  }
-
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
       <Header onOpenHistory={() => setHistoryOpen(true)} />
 
-      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 sm:py-8">
+      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 pt-2 sm:pt-2.5 pb-6 sm:pb-8">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 lg:gap-6 items-start">
           <InputPanel
             rawPrompt={rawPrompt}
-            setRawPrompt={setRawPrompt}
+            setRawPrompt={updateRawPrompt}
             useCase={useCase}
             setUseCase={setUseCase}
             tone={tone}
@@ -288,9 +380,13 @@ function App() {
             onOptimize={handleOptimize}
             onClear={handleClear}
             onUndo={handleUndo}
-            canUndo={history.length >= 2}
+            canUndo={history.length >= 2 || preClearSnapshot !== null}
+            onRedo={handleRedo}
+            canRedo={redoStack.length > 0}
             isOptimizing={isOptimizing}
             error={error}
+            warnOverridden={warnOverridden}
+            onOverrideWarn={() => setWarnOverridden(true)}
           />
           <OutputPanel
             result={result}
@@ -302,9 +398,6 @@ function App() {
             isOptimizing={isOptimizing}
             onSave={handleSave}
             isSaved={isSaved}
-            feedback={feedback}
-            onRate={handleRate}
-            onFlag={handleFlag}
           />
         </div>
       </main>

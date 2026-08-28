@@ -164,6 +164,28 @@ describe('Structure score — unstructured prompts earn nothing', () => {
   })
 })
 
+describe('Action verb detection', () => {
+  // The Clarity row is worth 20 of the 100 points and hangs entirely off
+  // hasAction. A substring scan handed those points to any prompt that merely
+  // contained a verb's letters — "playlist" read as "list".
+  it.each([
+    ['Write a blog post about caching'],
+    ['Please fix the memory leak'],
+    ['Planning the launch of our analytics product'],
+    ['Reviews of the new API surface are needed'],
+  ])('%s has an action', (prompt) => {
+    expect(analyzePrompt(prompt).hasAction).toBe(true)
+  })
+
+  it.each([
+    ['My playlist is broken on mobile'],
+    ['Her makeup tutorial channel'],
+    ['The fixture in the second bathroom'],
+  ])('%s has no action', (prompt) => {
+    expect(analyzePrompt(prompt).hasAction).toBe(false)
+  })
+})
+
 describe('Score totals', () => {
   it('always equals the sum of its breakdown rows', () => {
     const { prompt, taskType } = generateLocalOutput('Analyze the EV market', 'research', 'professional', 'paragraph')

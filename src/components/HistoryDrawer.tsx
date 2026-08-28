@@ -80,7 +80,7 @@ function RecentTab({ history, onRestore }: { history: HistoryItem[]; onRestore: 
                   <span className={`text-xs font-bold ${scolor}`}>{item.result.score}</span>
                   <span className={`text-[10px] ${scolor}`}>· {slabel}</span>
                 </div>
-                {i > 0 || reversed.length === 1 ? (
+                {i > 0 ? (
                   <button
                     onClick={() => onRestore(item)}
                     className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border border-white/60 bg-white/60 hover:bg-white hover:border-fuchsia-200 hover:text-fuchsia-600 text-slate-500 transition-colors shadow-sm"
@@ -96,9 +96,6 @@ function RecentTab({ history, onRestore }: { history: HistoryItem[]; onRestore: 
           )
         })}
       </div>
-      <p className="text-[10px] text-slate-400 text-center pt-2">
-        Showing {reversed.length} of 5 max · Session only
-      </p>
     </>
   )
 }

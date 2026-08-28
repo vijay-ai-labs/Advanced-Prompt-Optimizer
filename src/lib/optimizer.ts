@@ -1,4 +1,5 @@
 import type { UseCase, Tone, OutputFormat, OptimizedResult, PromptAnalysis, ScoreBreakdownItem } from './types'
+import { validatePrompt, requiresPlaceholders } from './promptValidation.js'
 
 // ── Detection patterns ─────────────────────────────────────────────────────
 
@@ -11,6 +12,11 @@ const ACTION_VERBS = [
   'fix', 'debug', 'refactor', 'make', 'compose', 'craft', 'prepare',
   'produce', 'define', 'teach', 'show', 'demonstrate', 'illustrate',
 ]
+
+// Whole words only, with the common inflections. A substring scan counted
+// "playlist" as "list" and "makeup" as "make", handing 20 Clarity points to
+// prompts that name no action at all.
+const ACTION_VERB_RE = new RegExp(`\\b(?:${ACTION_VERBS.join('|')})(?:e?s|e?d|ing|ning)?\\b`, 'i')
 
 const VAGUE_QUALITY_WORDS = [
   'something', 'stuff', 'things', 'whatever', 'anything',
@@ -46,7 +52,7 @@ export function analyzePrompt(raw: string): PromptAnalysis {
   const words = raw.trim().split(/\s+/).filter(Boolean)
 
   return {
-    hasAction: ACTION_VERBS.some((v) => lower.includes(v)),
+    hasAction: ACTION_VERB_RE.test(raw),
     hasAudience: AUDIENCE_RE.test(raw),
     hasOutputFormat: OUTPUT_FORMAT_RE.test(raw),
     hasTone: TONE_RE.test(raw),
@@ -433,6 +439,27 @@ type LocalTaskType =
 
 const GTM_DETECT_RE = /\b(go.to.market|go-to-market|gtm|g2m|market.entr(y|ies)|market.launch|launch.strateg|customer.acquisition|ideal.customer.profile|ICP\b|sales.motion|product.led.growth|PLG\b|pricing.strateg|revenue.strateg|pipeline.generat|B2B.SaaS.*(strateg|launch|grow|enter)|SaaS.*(go.to.market|gtm|market.entry)|demand.gen|sales.playbook|account.based.market|ABM\b|value.proposition.*SaaS|positioning.*SaaS|SaaS.*positioning)\b/i
 
+// Ordered keyword signals per task type. Order is significant — the first match
+// wins in detectTaskType, so a prompt mentioning both code and blogs is treated
+// as coding, exactly as before this table existed. The same signals also drive
+// the mode-mismatch check in the input panel, which is why they live in one place
+// instead of inline in the detector.
+const USE_CASE_SIGNALS: Array<{ taskType: LocalTaskType; re: RegExp }> = [
+  { taskType: 'gtm-strategy', re: GTM_DETECT_RE },
+  { taskType: 'coding', re: /\b(code|debug|fix|bug|api|script|function|component|react|typescript|javascript|python|sql|server|database|deploy|architecture)\b/gi },
+  { taskType: 'blog-content', re: /\b(blog|article|essay|story|write|newsletter|caption|content|post|draft|copy edit|rewrite)\b/gi },
+  { taskType: 'marketing', re: /\b(marketing|ad|campaign|landing page|sales copy|cta|brand|positioning|conversion|email sequence)\b/gi },
+  { taskType: 'research-analysis', re: /\b(research|analy[sz]e|compare|study|report|data|trend|market research|literature|sources?)\b/gi },
+  { taskType: 'business-strategy', re: /\b(strategy|business|plan|stakeholder|roadmap|proposal|pitch|revenue|operations|kpi|budget)\b/gi },
+  { taskType: 'image-generation', re: /\b(image|photo|picture|illustration|art|render|poster|logo|visual|scene|draw)\b/gi },
+]
+
+function countSignal(re: RegExp, text: string): number {
+  if (!re.global) return re.test(text) ? 1 : 0
+  re.lastIndex = 0
+  return (text.match(re) ?? []).length
+}
+
 function detectTaskType(rawPrompt: string, useCase: UseCase): LocalTaskType {
   if (useCase === 'gtm') return 'gtm-strategy'
   if (useCase === 'writing') return 'blog-content'
@@ -442,29 +469,36 @@ function detectTaskType(rawPrompt: string, useCase: UseCase): LocalTaskType {
   if (useCase === 'image-generation') return 'image-generation'
   if (useCase === 'marketing') return 'marketing'
 
-  if (GTM_DETECT_RE.test(rawPrompt)) return 'gtm-strategy'
-
   const text = rawPrompt.toLowerCase()
-  if (/\b(code|debug|fix|bug|api|script|function|component|react|typescript|javascript|python|sql|server|database|deploy|architecture)\b/.test(text)) {
-    return 'coding'
-  }
-  if (/\b(blog|article|essay|story|write|newsletter|caption|content|post|draft|copy edit|rewrite)\b/.test(text)) {
-    return 'blog-content'
-  }
-  if (/\b(marketing|ad|campaign|landing page|sales copy|cta|brand|positioning|conversion|email sequence)\b/.test(text)) {
-    return 'marketing'
-  }
-  if (/\b(research|analy[sz]e|compare|study|report|data|trend|market research|literature|sources?)\b/.test(text)) {
-    return 'research-analysis'
-  }
-  if (/\b(strategy|business|plan|stakeholder|roadmap|proposal|pitch|revenue|operations|kpi|budget)\b/.test(text)) {
-    return 'business-strategy'
-  }
-  if (/\b(image|photo|picture|illustration|art|render|poster|logo|visual|scene|draw)\b/.test(text)) {
-    return 'image-generation'
+  for (const { taskType, re } of USE_CASE_SIGNALS) {
+    if (countSignal(re, text) > 0) return taskType
   }
 
   return 'general'
+}
+
+/**
+ * Which use case the prompt text itself points at, ignoring the dropdown.
+ * Used to pick clarifier chips and to spot a prompt that contradicts the
+ * selected mode (Python code submitted under Image gen, say).
+ */
+export function detectUseCaseFromPrompt(rawPrompt: string): UseCase {
+  return mapTaskTypeToUseCase(detectTaskType(rawPrompt, 'general'))
+}
+
+/**
+ * Keyword hits per use case. A zero for the selected use case alongside a
+ * non-zero elsewhere is what makes a mode mismatch worth flagging — it means the
+ * prompt contains nothing at all belonging to the mode the user picked.
+ */
+export function countUseCaseSignals(rawPrompt: string): Partial<Record<UseCase, number>> {
+  const text = rawPrompt.toLowerCase()
+  const counts: Partial<Record<UseCase, number>> = {}
+  for (const { taskType, re } of USE_CASE_SIGNALS) {
+    const useCase = mapTaskTypeToUseCase(taskType)
+    counts[useCase] = (counts[useCase] ?? 0) + countSignal(re, text)
+  }
+  return counts
 }
 
 function mapTaskTypeToUseCase(taskType: LocalTaskType): UseCase {
@@ -929,7 +963,14 @@ export function generateLocalOutput(
   outputFormat: OutputFormat,
 ): OptimizedResult {
   const analysis = analyzePrompt(rawPrompt)
-  const cleanedTask = cleanTask(rawPrompt)
+  const verdict = validatePrompt(rawPrompt, useCase)
+  // A topic-less prompt gets placeholders rather than a subject this function
+  // made up. The offline fallback must not fabricate what the API is forbidden
+  // to fabricate.
+  const needsPlaceholders = requiresPlaceholders(verdict.code)
+  const cleanedTask = needsPlaceholders
+    ? `${cleanTask(rawPrompt)} about [USER INSERTS: specific topic] for [USER INSERTS: target audience]`
+    : cleanTask(rawPrompt)
   const taskType = detectTaskType(rawPrompt, useCase)
   const effectiveUseCase = mapTaskTypeToUseCase(taskType)
   const score = computeScore(analysis, taskType)
@@ -960,7 +1001,11 @@ export function generateLocalOutput(
     scoreBreakdown,
     afterScore,
     afterScoreBreakdown,
-    missingDetails: detectMissing(rawPrompt, analysis, effectiveUseCase).slice(0, 3),
+    missingDetails: (needsPlaceholders
+      ? ['No topic given — the prompt says what to do but not what about. Replace every [USER INSERTS: ...] token before using it.',
+         ...detectMissing(rawPrompt, analysis, effectiveUseCase)]
+      : detectMissing(rawPrompt, analysis, effectiveUseCase)
+    ).slice(0, 3),
     rawPromptSnapshot: rawPrompt,
   }
 }

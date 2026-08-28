@@ -30,9 +30,6 @@ export function Header({ onOpenHistory }: Props) {
             <Clock size={13} />
             <span className="hidden sm:inline">History</span>
           </button>
-          <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-medium shrink-0">
-            GPT-4o mini
-          </span>
         </div>
       </div>
     </header>
